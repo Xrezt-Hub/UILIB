@@ -1,46 +1,161 @@
---[[
-	Rexity UI: Save Manager + Theme Manager
-	- Save / load / delete / autoload configs (every component with a Flag is saved automatically)
-	- Export config to clipboard, import by paste, URL, or by dropping a .json in the configs folder
-	- Loading a config RE-APPLIES every saved value, so saved toggles turn on and their callbacks run
-	- Theme Manager: presets, hex colors, font search, custom font, save/load themes
-]]
-
-local Library = loadstring(game:HttpGet("https://raw.githubusercontent.com/Xrezt-Hub/UILIB/refs/heads/main/RexityUILibrary.lua"))()
 local HttpService = game:GetService("HttpService")
 
-local Window = Library:CreateWindow({
-	Name = "Rexity Test",
-	LoadingTitle = "Rexity Test",
-	LoadingSubtitle = "Save + Theme Manager",
-	ToggleKey = Enum.KeyCode.RightShift,
-	DefaultTabs = false,
-})
+local function HexToColor(hex)
+	hex = tostring(hex or ""):gsub("#", ""):gsub("%s", "")
+	if #hex == 3 then hex = hex:sub(1,1):rep(2) .. hex:sub(2,2):rep(2) .. hex:sub(3,3):rep(2) end
+	if #hex ~= 6 or not hex:match("^%x+$") then return nil end
+	return Color3.fromRGB(tonumber(hex:sub(1,2),16), tonumber(hex:sub(3,4),16), tonumber(hex:sub(5,6),16))
+end
+local function ColorToHex(c)
+	return string.format("#%02X%02X%02X", math.floor(c.R*255+0.5), math.floor(c.G*255+0.5), math.floor(c.B*255+0.5))
+end
+local function Sanitize(s)
+	return (tostring(s or ""):gsub("[^%w_%- ]", "")):sub(1, 40)
+end
+local fsOk = type(writefile) == "function" and type(readfile) == "function" and type(isfile) == "function"
+	and type(isfolder) == "function" and type(makefolder) == "function" and type(listfiles) == "function"
 
--- ════════════════════════════════════════════════════════════════
---  FLAG REGISTRY (auto-registers every component that has a Flag)
--- ════════════════════════════════════════════════════════════════
-local Registry = {}
-local TabClass = getmetatable(Window.HomeTab).__index
-local Kinds = {
-	CreateToggle = "toggle",
-	CreateSlider = "slider",
-	CreateDropdown = "dropdown",
-	CreateInput = "input",
-	CreateKeybind = "keybind",
+-- ═════════════ THEME MANAGER ═════════════
+local ThemeManager = { Inputs = {}, Originals = setmetatable({}, { __mode = "k" }) }
+ThemeManager.Default = { Accent = "#EB3852", Background = "#0D0D12", Sidebar = "#0B0B0F", Font = "Default" }
+ThemeManager.Current = {}
+for k, v in pairs(ThemeManager.Default) do ThemeManager.Current[k] = v end
+ThemeManager.Presets = {
+	Crimson = { Accent = "#EB3852", Background = "#0D0D12", Sidebar = "#0B0B0F" },
+	Ocean = { Accent = "#388CFF", Background = "#0A0F1A", Sidebar = "#080C15" },
+	Violet = { Accent = "#8A5CF6", Background = "#100D18", Sidebar = "#0D0B14" },
+	Emerald = { Accent = "#28C882", Background = "#0A130F", Sidebar = "#08100C" },
+	Amber = { Accent = "#FFAA32", Background = "#14100A", Sidebar = "#100D08" },
+	Midnight = { Accent = "#5865F2", Background = "#000000", Sidebar = "#050507" },
 }
-for method, kind in pairs(Kinds) do
-	local original = TabClass[method]
-	TabClass[method] = function(self, cfg)
-		local obj = original(self, cfg)
-		if type(cfg) == "table" and cfg.Flag then
-			Registry[cfg.Flag] = { Object = obj, Kind = kind }
-		end
-		return obj
-	end
+
+function ThemeManager:SetWindow(window)
+	self.Window = window
+	window.Gui.DescendantAdded:Connect(function(d) task.defer(self._Style, self, d) end)
 end
 
-local Validators = {
+function ThemeManager:SetColor(key, hex)
+	local c = HexToColor(hex)
+	if not c then return false end
+	local new = ColorToHex(c)
+	if key == "Accent" then
+		self.Window:SetAccent(c)
+	else
+		local from = HexToColor(self.Current[key])
+		for _, d in ipairs(self.Window.Gui:GetDescendants()) do
+			if d:IsA("GuiObject") and d.BackgroundTransparency < 1 and d.BackgroundColor3 == from then
+				d.BackgroundColor3 = c
+			end
+		end
+	end
+	self.Current[key] = new
+	if self.Inputs[key] then self.Inputs[key]:Set(new, true) end
+	return true
+end
+
+function ThemeManager:_Style(d)
+	if not (d:IsA("TextLabel") or d:IsA("TextButton") or d:IsA("TextBox")) or d.Name == "Icon" then return end
+	if self.Originals[d] == nil then self.Originals[d] = d.Font end
+	local f = self.ActiveFont
+	if f == nil then pcall(function() d.Font = self.Originals[d] end)
+	elseif typeof(f) == "EnumItem" then d.Font = f
+	else d.FontFace = f end
+end
+
+function ThemeManager:SetFont(name)
+	local font
+	if name and name ~= "Default" then
+		if name:sub(1, 7) == "custom:" then
+			local ok, f = pcall(Font.new, name:sub(8), Enum.FontWeight.Regular, Enum.FontStyle.Normal)
+			font = ok and f or nil
+		else
+			local ok, f = pcall(function() return Enum.Font[name] end)
+			font = ok and f or nil
+		end
+	end
+	self.ActiveFont = font
+	self.Current.Font = font and name or "Default"
+	for _, d in ipairs(self.Window.Gui:GetDescendants()) do self:_Style(d) end
+end
+
+function ThemeManager:Apply(t)
+	if type(t) ~= "table" then return end
+	for _, key in ipairs({ "Accent", "Background", "Sidebar" }) do
+		if type(t[key]) == "string" then self:SetColor(key, t[key]) end
+	end
+	if type(t.Font) == "string" then self:SetFont(t.Font) end
+end
+
+function ThemeManager:GetTheme()
+	local copy = {}
+	for k, v in pairs(self.Current) do copy[k] = v end
+	return copy
+end
+
+function ThemeManager:BuildSection(tab)
+	local names = {}
+	for _, item in ipairs(Enum.Font:GetEnumItems()) do
+		if item.Name ~= "Unknown" and item.Name ~= "Legacy" then table.insert(names, item.Name) end
+	end
+	table.sort(names)
+	local popular = {}
+	for _, n in ipairs({ "Gotham", "GothamBold", "SourceSans", "Ubuntu", "Roboto", "RobotoMono", "Nunito", "Oswald",
+		"Merriweather", "FredokaOne", "Bangers", "PermanentMarker", "Code", "Arcade", "SciFi", "Fantasy", "Arial", "Jura" }) do
+		if table.find(names, n) then table.insert(popular, n) end
+	end
+
+	tab:CreateSection("Theme Manager")
+	local presetNames = {}
+	for k in pairs(self.Presets) do table.insert(presetNames, k) end
+	table.sort(presetNames)
+	tab:CreateDropdown({
+		Name = "Preset", Options = presetNames, Placeholder = "Choose a preset",
+		Callback = function(n) self:Apply(self.Presets[n]) end,
+	})
+	for _, key in ipairs({ "Accent", "Background", "Sidebar" }) do
+		self.Inputs[key] = tab:CreateInput({
+			Name = key .. " (Hex)", CurrentValue = self.Current[key], PlaceholderText = "#RRGGBB",
+			Callback = function(t)
+				if not self:SetColor(key, t) then
+					self.Window:Notify({ Title = "Invalid hex", Content = "Use a color like #EB3852", Type = "Error", Duration = 3 })
+				end
+			end,
+		})
+	end
+
+	local fontDD
+	tab:CreateInput({
+		Name = "Search Fonts", PlaceholderText = "Type to filter...",
+		OnChanged = function(text)
+			text = string.lower(text or "")
+			local results = {}
+			for _, n in ipairs(names) do
+				if text == "" or string.find(string.lower(n), text, 1, true) then table.insert(results, n) end
+			end
+			fontDD:Refresh(results, true)
+		end,
+	})
+	fontDD = tab:CreateDropdown({
+		Name = "All Fonts (" .. #names .. ")", Options = names, Placeholder = "Select a font",
+		Callback = function(n) self:SetFont(n) end,
+	})
+	tab:CreateDropdown({
+		Name = "Popular Fonts", Options = popular, Placeholder = "Select a font",
+		Callback = function(n) self:SetFont(n) end,
+	})
+	tab:CreateInput({
+		Name = "Custom Font Family", PlaceholderText = "rbxasset://fonts/families/Montserrat.json",
+		Callback = function(t) if t ~= "" then self:SetFont("custom:" .. t) end end,
+	})
+	tab:CreateButton({
+		Name = "Reset Theme",
+		Callback = function() self:Apply(self.Default) end,
+	})
+end
+
+-- ═════════════ SAVE MANAGER ═════════════
+local SaveManager = { Registry = {}, Folder = "Rexity", Selected = nil, NameText = "", Pasted = "" }
+SaveManager.Validators = {
 	toggle = function(v) return type(v) == "boolean" end,
 	slider = function(v) return type(v) == "number" end,
 	dropdown = function(v) return type(v) == "string" or type(v) == "table" end,
@@ -48,579 +163,183 @@ local Validators = {
 	keybind = function(v) return type(v) == "string" end,
 }
 
--- ════════════════════════════════════════════════════════════════
---  FILE HELPERS
--- ════════════════════════════════════════════════════════════════
-local ROOT = "RexityTest"
-local CFG = ROOT .. "/configs"
-local THM = ROOT .. "/themes"
-local AUTO = ROOT .. "/autoload.txt"
-
-local fsOk = type(writefile) == "function" and type(readfile) == "function"
-	and type(isfile) == "function" and type(isfolder) == "function"
-	and type(makefolder) == "function" and type(listfiles) == "function"
-
-local function EnsureFolders()
-	if not fsOk then return end
-	for _, path in ipairs({ ROOT, CFG, THM }) do
-		if not isfolder(path) then pcall(makefolder, path) end
+function SaveManager:SetWindow(w) self.Window = w end
+function SaveManager:SetThemeManager(tm) self.ThemeManager = tm end
+function SaveManager:SetFolder(f)
+	self.Folder = f
+	self.ConfigFolder = f .. "/configs"
+	self.AutoFile = f .. "/autoload.txt"
+	if fsOk then
+		for _, p in ipairs({ f, self.ConfigFolder }) do
+			if not isfolder(p) then pcall(makefolder, p) end
+		end
 	end
 end
-EnsureFolders()
 
-local function ListFiles(folder)
+-- Call BEFORE creating components so every Flag gets registered
+function SaveManager:Hook()
+	local TabClass = getmetatable(self.Window.HomeTab).__index
+	local kinds = { CreateToggle = "toggle", CreateSlider = "slider", CreateDropdown = "dropdown",
+		CreateInput = "input", CreateKeybind = "keybind" }
+	for method, kind in pairs(kinds) do
+		local original = TabClass[method]
+		TabClass[method] = function(tab, cfg)
+			local obj = original(tab, cfg)
+			if type(cfg) == "table" and cfg.Flag then self.Registry[cfg.Flag] = { Object = obj, Kind = kind } end
+			return obj
+		end
+	end
+end
+
+function SaveManager:Collect()
+	local flags = {}
+	for flag in pairs(self.Registry) do
+		local v = self.Window.Flags[flag]
+		if v ~= nil then flags[flag] = v end
+	end
+	return { Version = 1, Flags = flags, Theme = self.ThemeManager and self.ThemeManager:GetTheme() or nil }
+end
+
+function SaveManager:List()
 	local out = {}
 	if not fsOk then return out end
-	local ok, files = pcall(listfiles, folder)
+	local ok, files = pcall(listfiles, self.ConfigFolder)
 	if ok then
-		for _, path in ipairs(files) do
-			local name = path:match("([^/\\]+)%.json$")
-			if name then table.insert(out, name) end
+		for _, p in ipairs(files) do
+			local n = p:match("([^/\\]+)%.json$")
+			if n then table.insert(out, n) end
 		end
 	end
 	table.sort(out)
 	return out
 end
 
-local function Sanitize(text)
-	local clean = tostring(text or ""):gsub("[^%w_%- ]", "")
-	return clean:sub(1, 40)
+function SaveManager:Save(name)
+	name = Sanitize(name)
+	if name == "" then return false, "Enter a config name" end
+	if not fsOk then return false, "No file functions" end
+	return pcall(function() writefile(self.ConfigFolder .. "/" .. name .. ".json", HttpService:JSONEncode(self:Collect())) end)
 end
 
-local function WriteJSON(path, data)
-	if not fsOk then return false, "File functions unavailable" end
-	return pcall(function()
-		writefile(path, HttpService:JSONEncode(data))
-	end)
-end
-
-local function ReadJSON(path)
-	if not fsOk or not isfile(path) then return nil end
-	local ok, data = pcall(function()
-		return HttpService:JSONDecode(readfile(path))
-	end)
-	return ok and data or nil
-end
-
-local function Notify(title, content, kind)
-	Window:Notify({ Title = title, Content = content, Type = kind or "Info", Duration = 3.5 })
-end
-
--- ════════════════════════════════════════════════════════════════
---  THEME MANAGER (logic)
--- ════════════════════════════════════════════════════════════════
-local DEFAULT_THEME = { Accent = "#EB3852", Background = "#0D0D12", Sidebar = "#0B0B0F", Font = "Default" }
-local Theme = {}
-for k, v in pairs(DEFAULT_THEME) do Theme[k] = v end
-
-local function HexToColor(hex)
-	hex = tostring(hex or ""):gsub("#", ""):gsub("%s", "")
-	if #hex == 3 then
-		hex = hex:sub(1, 1):rep(2) .. hex:sub(2, 2):rep(2) .. hex:sub(3, 3):rep(2)
-	end
-	if #hex ~= 6 or not hex:match("^%x+$") then return nil end
-	return Color3.fromRGB(tonumber(hex:sub(1, 2), 16), tonumber(hex:sub(3, 4), 16), tonumber(hex:sub(5, 6), 16))
-end
-
-local function ColorToHex(c)
-	return string.format("#%02X%02X%02X", math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5))
-end
-
-local accentInput, backgroundInput, sidebarInput -- set later
-
-local function Recolor(fromHex, toHex)
-	local from, to = HexToColor(fromHex), HexToColor(toHex)
-	if not from or not to then return end
-	for _, d in ipairs(Window.Gui:GetDescendants()) do
-		if d:IsA("GuiObject") and d.BackgroundTransparency < 1 and d.BackgroundColor3 == from then
-			d.BackgroundColor3 = to
-		end
-	end
-end
-
-local function SetAccent(hex)
-	local c = HexToColor(hex)
-	if not c then return false end
-	Window:SetAccent(c)
-	Theme.Accent = ColorToHex(c)
-	if accentInput then accentInput:Set(Theme.Accent, true) end
-	return true
-end
-
-local function SetBackground(hex)
-	local c = HexToColor(hex)
-	if not c then return false end
-	local new = ColorToHex(c)
-	Recolor(Theme.Background, new)
-	Theme.Background = new
-	if backgroundInput then backgroundInput:Set(new, true) end
-	return true
-end
-
-local function SetSidebar(hex)
-	local c = HexToColor(hex)
-	if not c then return false end
-	local new = ColorToHex(c)
-	Recolor(Theme.Sidebar, new)
-	Theme.Sidebar = new
-	if sidebarInput then sidebarInput:Set(new, true) end
-	return true
-end
-
--- Fonts
-local Originals = setmetatable({}, { __mode = "k" })
-local activeFont = nil
-
-local function ResolveFont(name)
-	if not name or name == "Default" then return nil end
-	if name:sub(1, 7) == "custom:" then
-		local ok, font = pcall(Font.new, name:sub(8), Enum.FontWeight.Regular, Enum.FontStyle.Normal)
-		return ok and font or nil
-	end
-	local ok, item = pcall(function() return Enum.Font[name] end)
-	return ok and item or nil
-end
-
-local function StyleText(d)
-	if not (d:IsA("TextLabel") or d:IsA("TextButton") or d:IsA("TextBox")) or d.Name == "Icon" then return end
-	if Originals[d] == nil then Originals[d] = d.Font end
-	if activeFont == nil then
-		pcall(function() d.Font = Originals[d] end)
-	elseif typeof(activeFont) == "EnumItem" then
-		d.Font = activeFont
-	else
-		d.FontFace = activeFont
-	end
-end
-
-Window.Gui.DescendantAdded:Connect(function(d)
-	task.defer(StyleText, d)
-end)
-
-local function SetFont(name)
-	local font = ResolveFont(name)
-	activeFont = font
-	Theme.Font = font and name or "Default"
-	for _, d in ipairs(Window.Gui:GetDescendants()) do
-		StyleText(d)
-	end
-	return font ~= nil or name == "Default"
-end
-
-local function ApplyTheme(t)
-	if type(t) ~= "table" then return end
-	if type(t.Accent) == "string" then SetAccent(t.Accent) end
-	if type(t.Background) == "string" then SetBackground(t.Background) end
-	if type(t.Sidebar) == "string" then SetSidebar(t.Sidebar) end
-	if type(t.Font) == "string" then SetFont(t.Font) end
-end
-
-local Presets = {
-	Crimson = { Accent = "#EB3852", Background = "#0D0D12", Sidebar = "#0B0B0F", Font = "Default" },
-	Ocean = { Accent = "#388CFF", Background = "#0A0F1A", Sidebar = "#080C15", Font = "Default" },
-	Violet = { Accent = "#8A5CF6", Background = "#100D18", Sidebar = "#0D0B14", Font = "Default" },
-	Emerald = { Accent = "#28C882", Background = "#0A130F", Sidebar = "#08100C", Font = "Default" },
-	Amber = { Accent = "#FFAA32", Background = "#14100A", Sidebar = "#100D08", Font = "Default" },
-	Midnight = { Accent = "#5865F2", Background = "#000000", Sidebar = "#050507", Font = "Default" },
-}
-local PresetNames = { "Crimson", "Ocean", "Violet", "Emerald", "Amber", "Midnight" }
-
--- Font lists
-local FontNames = {}
-for _, item in ipairs(Enum.Font:GetEnumItems()) do
-	if item.Name ~= "Unknown" and item.Name ~= "Legacy" then
-		table.insert(FontNames, item.Name)
-	end
-end
-table.sort(FontNames)
-
-local Popular = {}
-for _, name in ipairs({
-	"Gotham", "GothamMedium", "GothamBold", "GothamBlack", "SourceSans", "SourceSansBold", "Ubuntu",
-	"Roboto", "RobotoMono", "RobotoCondensed", "Nunito", "Oswald", "Merriweather", "JosefinSans",
-	"TitilliumWeb", "FredokaOne", "Bangers", "PermanentMarker", "IndieFlower", "Code", "Arcade",
-	"SciFi", "Fantasy", "Cartoon", "Arial", "ArialBold", "Highway", "Jura", "Michroma",
-}) do
-	if table.find(FontNames, name) then table.insert(Popular, name) end
-end
-
--- ════════════════════════════════════════════════════════════════
---  SAVE MANAGER (logic)
--- ════════════════════════════════════════════════════════════════
-local function Collect()
-	local flags = {}
-	for flag in pairs(Registry) do
-		local value = Window.Flags[flag]
-		if value ~= nil then flags[flag] = value end
-	end
-	local themeCopy = {}
-	for k, v in pairs(Theme) do themeCopy[k] = v end
-	return { Version = 1, Flags = flags, Theme = themeCopy }
-end
-
--- Re-applies saved values. Toggles fire their callbacks, so features start running.
-local function ApplyConfig(data)
-	if type(data) ~= "table" or type(data.Flags) ~= "table" then
-		return false, "Invalid config"
-	end
-	if type(data.Theme) == "table" then ApplyTheme(data.Theme) end
-	local applied = 0
+-- Re-applies every saved value; toggles fire their callbacks so features start running
+function SaveManager:ApplyData(data)
+	if type(data) ~= "table" or type(data.Flags) ~= "table" then return false, "Invalid config" end
+	if type(data.Theme) == "table" and self.ThemeManager then self.ThemeManager:Apply(data.Theme) end
+	local count = 0
 	for flag, value in pairs(data.Flags) do
-		local entry = Registry[flag]
-		if entry and Validators[entry.Kind](value) then
-			if pcall(entry.Object.Set, entry.Object, value) then
-				applied += 1
-			end
+		local e = self.Registry[flag]
+		if e and self.Validators[e.Kind](value) then
+			if pcall(e.Object.Set, e.Object, value) then count += 1 end
 			task.wait()
 		end
 	end
-	return true, applied
+	return true, count
 end
 
--- ════════════════════════════════════════════════════════════════
---  TABS
--- ════════════════════════════════════════════════════════════════
-local Features = Window:CreateTab("Features", "main")
-local Configs = Window:CreateTab("Configs", "tools")
-local Themes = Window:CreateTab("Themes", "visuals")
-
-Window.HomeTab.Button.Visible = false
-Window:SelectTab(Features)
-
--- ───────── Features (put YOUR toggles here; each needs a unique Flag) ─────────
-Features:CreateSection("Example Features (saved automatically)")
-Features:CreateToggle({
-	Name = "Example Toggle A",
-	CurrentValue = false,
-	Flag = "ExampleA",
-	Callback = function(v) print("Example A:", v) end,
-})
-Features:CreateToggle({
-	Name = "Example Toggle B",
-	CurrentValue = false,
-	Flag = "ExampleB",
-	Callback = function(v) print("Example B:", v) end,
-})
-Features:CreateSlider({
-	Name = "Example Slider",
-	Range = { 0, 100 },
-	Increment = 1,
-	CurrentValue = 50,
-	Flag = "ExampleSlider",
-	Callback = function(v) print("Slider:", v) end,
-})
-Features:CreateDropdown({
-	Name = "Example Mode",
-	Options = { "Easy", "Normal", "Hard" },
-	CurrentOption = "Normal",
-	Flag = "ExampleMode",
-	Callback = function(v) print("Mode:", v) end,
-})
-Features:CreateKeybind({
-	Name = "Example Key",
-	CurrentKeybind = "E",
-	Flag = "ExampleKey",
-	Callback = function() print("Key pressed") end,
-})
-
--- ───────── Configs ─────────
-local selected, nameText, pasted, urlText = nil, "", "", ""
-local configDropdown
-
-local function Refresh()
-	configDropdown:Refresh(ListFiles(CFG), true)
+function SaveManager:Load(name)
+	local path = self.ConfigFolder .. "/" .. tostring(name) .. ".json"
+	if not fsOk or not isfile(path) then return false, "Config not found" end
+	local ok, data = pcall(function() return HttpService:JSONDecode(readfile(path)) end)
+	if not ok then return false, "Corrupt config" end
+	return self:ApplyData(data)
 end
 
-local function CurrentName()
-	local n = Sanitize(nameText)
-	if n == "" then n = selected or "" end
-	return n
+function SaveManager:Notify(title, content, kind)
+	self.Window:Notify({ Title = title, Content = content, Type = kind or "Info", Duration = 3.5 })
 end
 
-Configs:CreateSection("Save Manager")
-if not fsOk then
-	Configs:CreateLabel({ Text = "Your executor has no file functions. Saving to disk is unavailable, but Export/Import by clipboard may still work.", Color = Color3.fromRGB(255, 190, 60) })
-end
-
-Configs:CreateInput({
-	Name = "Config Name",
-	PlaceholderText = "e.g. Best BFC Chain",
-	OnChanged = function(t) nameText = t end,
-	Callback = function(t) nameText = t end,
-})
-
-configDropdown = Configs:CreateDropdown({
-	Name = "Saved Configs",
-	Options = ListFiles(CFG),
-	Placeholder = "Select a config",
-	Callback = function(v) selected = v end,
-})
-
-Configs:CreateButton({
-	Name = "Save Config",
-	Callback = function()
-		local name = CurrentName()
-		if name == "" then return Notify("Save", "Type a config name first.", "Warning") end
-		local ok, err = WriteJSON(CFG .. "/" .. name .. ".json", Collect())
-		if ok then
-			Refresh()
-			Notify("Saved", name, "Success")
-		else
-			Notify("Save failed", tostring(err), "Error")
-		end
-	end,
-})
-
-Configs:CreateButton({
-	Name = "Load Selected Config",
-	Callback = function()
-		if not selected then return Notify("Load", "Select a config first.", "Warning") end
-		local data = ReadJSON(CFG .. "/" .. selected .. ".json")
-		if not data then return Notify("Load failed", "File missing or corrupt.", "Error") end
-		task.spawn(function()
-			local ok, count = ApplyConfig(data)
-			if ok then Notify("Loaded", selected .. " (" .. count .. " settings applied)", "Success")
-			else Notify("Load failed", tostring(count), "Error") end
-		end)
-	end,
-})
-
-Configs:CreateButton({
-	Name = "Overwrite Selected Config",
-	Callback = function()
-		if not selected then return Notify("Overwrite", "Select a config first.", "Warning") end
-		local ok, err = WriteJSON(CFG .. "/" .. selected .. ".json", Collect())
-		if ok then Notify("Overwritten", selected, "Success") else Notify("Failed", tostring(err), "Error") end
-	end,
-})
-
-Configs:CreateButton({
-	Name = "Delete Selected Config",
-	Callback = function()
-		if not selected or not fsOk then return Notify("Delete", "Select a config first.", "Warning") end
-		local path = CFG .. "/" .. selected .. ".json"
-		if type(delfile) == "function" and isfile(path) then
-			pcall(delfile, path)
-			Notify("Deleted", selected, "Success")
-			selected = nil
-			configDropdown:Set(nil, true)
-			Refresh()
-		else
-			Notify("Delete failed", "delfile is not available.", "Error")
-		end
-	end,
-})
-
-Configs:CreateButton({ Name = "Refresh List", Callback = Refresh })
-
-Configs:CreateSection("Autoload")
-Configs:CreateButton({
-	Name = "Set Selected as Autoload",
-	Callback = function()
-		if not selected or not fsOk then return Notify("Autoload", "Select a config first.", "Warning") end
-		pcall(writefile, AUTO, selected)
-		Notify("Autoload set", selected .. " will load on start.", "Success")
-	end,
-})
-Configs:CreateButton({
-	Name = "Clear Autoload",
-	Callback = function()
-		if fsOk and isfile(AUTO) then pcall(writefile, AUTO, "") end
-		Notify("Autoload", "Cleared.", "Info")
-	end,
-})
-
-Configs:CreateSection("Share / Import")
-Configs:CreateButton({
-	Name = "Copy Current Config (Export)",
-	Callback = function()
-		local clip = setclipboard or toclipboard
-		if type(clip) ~= "function" then return Notify("Export", "Clipboard is unavailable.", "Warning") end
-		clip(HttpService:JSONEncode(Collect()))
-		Notify("Exported", "Config copied to clipboard. Send it to anyone.", "Success")
-	end,
-})
-Configs:CreateInput({
-	Name = "Paste Config JSON",
-	PlaceholderText = "Paste exported config",
-	Callback = function(t) pasted = t end,
-})
-
-local function ImportData(raw)
-	local ok, data = pcall(function() return HttpService:JSONDecode(raw) end)
-	if not ok or type(data) ~= "table" or type(data.Flags) ~= "table" then
-		return Notify("Import failed", "That is not a valid config.", "Error")
-	end
-	local name = Sanitize(nameText)
-	if name == "" then name = "imported_" .. os.time() end
-	if fsOk then
-		WriteJSON(CFG .. "/" .. name .. ".json", data)
-		Refresh()
-	end
+function SaveManager:LoadAutoload()
 	task.spawn(function()
-		local applied, count = ApplyConfig(data)
-		if applied then Notify("Imported", name .. " (" .. count .. " settings applied)", "Success") end
+		repeat task.wait(0.1) until not self.Window.Loading or self.Window.Destroyed
+		if self.Window.Destroyed or not fsOk or not isfile(self.AutoFile) then return end
+		local name = Sanitize(readfile(self.AutoFile))
+		if name == "" then return end
+		task.wait(0.5)
+		local ok, count = self:Load(name)
+		if ok then self:Notify("Autoload", name .. " (" .. count .. " applied)", "Success") end
 	end)
 end
 
-Configs:CreateButton({
-	Name = "Import Pasted Config",
-	Callback = function()
-		if pasted == "" then return Notify("Import", "Paste a config first.", "Warning") end
-		ImportData(pasted)
-	end,
-})
-Configs:CreateInput({
-	Name = "Import From URL",
-	PlaceholderText = "https://.../config.json",
-	Callback = function(t) urlText = t end,
-})
-Configs:CreateButton({
-	Name = "Import From URL (Apply)",
-	Callback = function()
-		if urlText == "" then return Notify("Import", "Enter a URL first.", "Warning") end
-		local ok, body = pcall(function() return game:HttpGet(urlText) end)
-		if not ok then return Notify("Import failed", "Could not download the file.", "Error") end
-		ImportData(body)
-	end,
-})
-Configs:CreateParagraph({
-	Title = "How it works",
-	Content = "Configs are plain data. Only settings that exist in this UI are applied, and nothing in a config is executed as code. You can also drop a .json file into the " .. CFG .. " folder and press Refresh List.",
-})
-
--- ───────── Themes ─────────
-Themes:CreateSection("Presets")
-Themes:CreateDropdown({
-	Name = "Theme Preset",
-	Options = PresetNames,
-	Placeholder = "Choose a preset",
-	Callback = function(name) ApplyTheme(Presets[name]) end,
-})
-
-Themes:CreateSection("Colors (Hex)")
-accentInput = Themes:CreateInput({
-	Name = "Accent Color",
-	CurrentValue = Theme.Accent,
-	PlaceholderText = "#RRGGBB",
-	Callback = function(t)
-		if not SetAccent(t) then Notify("Invalid hex", "Use a color like #EB3852", "Error") end
-	end,
-})
-backgroundInput = Themes:CreateInput({
-	Name = "Background Color",
-	CurrentValue = Theme.Background,
-	PlaceholderText = "#RRGGBB",
-	Callback = function(t)
-		if not SetBackground(t) then Notify("Invalid hex", "Use a color like #0D0D12", "Error") end
-	end,
-})
-sidebarInput = Themes:CreateInput({
-	Name = "Sidebar Color",
-	CurrentValue = Theme.Sidebar,
-	PlaceholderText = "#RRGGBB",
-	Callback = function(t)
-		if not SetSidebar(t) then Notify("Invalid hex", "Use a color like #0B0B0F", "Error") end
-	end,
-})
-
-Themes:CreateSection("Fonts")
-local fontDropdown
-Themes:CreateInput({
-	Name = "Search Fonts",
-	PlaceholderText = "Type to filter...",
-	OnChanged = function(text)
-		text = string.lower(text or "")
-		local results = {}
-		for _, name in ipairs(FontNames) do
-			if text == "" or string.find(string.lower(name), text, 1, true) then
-				table.insert(results, name)
-			end
-		end
-		fontDropdown:Refresh(results, true)
-	end,
-})
-fontDropdown = Themes:CreateDropdown({
-	Name = "All Fonts (" .. #FontNames .. ")",
-	Options = FontNames,
-	Placeholder = "Select a font",
-	Callback = function(name) SetFont(name) end,
-})
-Themes:CreateDropdown({
-	Name = "Popular Fonts",
-	Options = Popular,
-	Placeholder = "Select a font",
-	Callback = function(name) SetFont(name) end,
-})
-Themes:CreateInput({
-	Name = "Custom Font Family",
-	PlaceholderText = "rbxasset://fonts/families/Montserrat.json",
-	Callback = function(t)
-		if t == "" then return end
-		SetFont("custom:" .. t)
-		Notify("Custom font", "Applied. If nothing changed, the family path is invalid.", "Info")
-	end,
-})
-Themes:CreateButton({
-	Name = "Reset Font",
-	Callback = function() SetFont("Default") end,
-})
-
-Themes:CreateSection("Saved Themes")
-local themeName, selectedTheme = "", nil
-local themeDropdown
-Themes:CreateInput({
-	Name = "Theme Name",
-	PlaceholderText = "My Theme",
-	OnChanged = function(t) themeName = t end,
-})
-themeDropdown = Themes:CreateDropdown({
-	Name = "Your Themes",
-	Options = ListFiles(THM),
-	Placeholder = "Select a theme",
-	Callback = function(v) selectedTheme = v end,
-})
-Themes:CreateButton({
-	Name = "Save Current Theme",
-	Callback = function()
-		local name = Sanitize(themeName)
-		if name == "" then return Notify("Theme", "Type a theme name first.", "Warning") end
-		local copy = {}
-		for k, v in pairs(Theme) do copy[k] = v end
-		local ok, err = WriteJSON(THM .. "/" .. name .. ".json", copy)
-		if ok then
-			themeDropdown:Refresh(ListFiles(THM), true)
-			Notify("Theme saved", name, "Success")
+function SaveManager:BuildSection(tab)
+	local dd
+	local function refresh() dd:Refresh(self:List(), true) end
+	tab:CreateSection("Save Manager")
+	tab:CreateInput({
+		Name = "Config Name", PlaceholderText = "e.g. My Config",
+		OnChanged = function(t) self.NameText = t end,
+	})
+	dd = tab:CreateDropdown({
+		Name = "Saved Configs", Options = self:List(), Placeholder = "Select a config",
+		Callback = function(v) self.Selected = v end,
+	})
+	tab:CreateButton({ Name = "Save Config", Callback = function()
+		local ok, err = self:Save(self.NameText ~= "" and self.NameText or self.Selected)
+		if ok then refresh() self:Notify("Saved", "Config saved.", "Success")
+		else self:Notify("Save failed", tostring(err), "Error") end
+	end })
+	tab:CreateButton({ Name = "Load Selected", Callback = function()
+		if not self.Selected then return self:Notify("Load", "Select a config first.", "Warning") end
+		task.spawn(function()
+			local ok, res = self:Load(self.Selected)
+			if ok then self:Notify("Loaded", self.Selected .. " (" .. res .. " applied)", "Success")
+			else self:Notify("Load failed", tostring(res), "Error") end
+		end)
+	end })
+	tab:CreateButton({ Name = "Overwrite Selected", Callback = function()
+		if not self.Selected then return self:Notify("Overwrite", "Select a config first.", "Warning") end
+		local ok = self:Save(self.Selected)
+		self:Notify(ok and "Overwritten" or "Failed", self.Selected, ok and "Success" or "Error")
+	end })
+	tab:CreateButton({ Name = "Delete Selected", Callback = function()
+		local path = self.Selected and (self.ConfigFolder .. "/" .. self.Selected .. ".json")
+		if path and type(delfile) == "function" and isfile(path) then
+			pcall(delfile, path)
+			self.Selected = nil
+			dd:Set(nil, true)
+			refresh()
+			self:Notify("Deleted", "Config removed.", "Success")
 		else
-			Notify("Save failed", tostring(err), "Error")
+			self:Notify("Delete", "Select a config first.", "Warning")
 		end
-	end,
-})
-Themes:CreateButton({
-	Name = "Load Selected Theme",
-	Callback = function()
-		if not selectedTheme then return Notify("Theme", "Select a theme first.", "Warning") end
-		local data = ReadJSON(THM .. "/" .. selectedTheme .. ".json")
-		if data then ApplyTheme(data) Notify("Theme loaded", selectedTheme, "Success")
-		else Notify("Load failed", "File missing or corrupt.", "Error") end
-	end,
-})
-Themes:CreateButton({
-	Name = "Reset Theme to Default",
-	Callback = function() ApplyTheme(DEFAULT_THEME) end,
-})
+	end })
+	tab:CreateButton({ Name = "Refresh List", Callback = refresh })
 
--- ════════════════════════════════════════════════════════════════
---  AUTOLOAD
--- ════════════════════════════════════════════════════════════════
-task.spawn(function()
-	repeat task.wait(0.1) until not Window.Loading or Window.Destroyed
-	if Window.Destroyed or not fsOk or not isfile(AUTO) then return end
-	local name = Sanitize(readfile(AUTO))
-	if name == "" then return end
-	local data = ReadJSON(CFG .. "/" .. name .. ".json")
-	if not data then return end
-	task.wait(0.5)
-	local ok, count = ApplyConfig(data)
-	if ok then Notify("Autoload", name .. " (" .. count .. " settings applied)", "Success") end
-end)
+	tab:CreateSection("Autoload / Share")
+	tab:CreateButton({ Name = "Set Selected as Autoload", Callback = function()
+		if not self.Selected or not fsOk then return self:Notify("Autoload", "Select a config first.", "Warning") end
+		writefile(self.AutoFile, self.Selected)
+		self:Notify("Autoload", self.Selected .. " will load on start.", "Success")
+	end })
+	tab:CreateButton({ Name = "Clear Autoload", Callback = function()
+		if fsOk and isfile(self.AutoFile) then writefile(self.AutoFile, "") end
+		self:Notify("Autoload", "Cleared.", "Info")
+	end })
+	tab:CreateButton({ Name = "Copy Config (Export)", Callback = function()
+		local clip = setclipboard or toclipboard
+		if type(clip) ~= "function" then return self:Notify("Export", "Clipboard unavailable.", "Warning") end
+		clip(HttpService:JSONEncode(self:Collect()))
+		self:Notify("Exported", "Copied to clipboard.", "Success")
+	end })
+	tab:CreateInput({
+		Name = "Paste Config JSON", PlaceholderText = "Paste exported config",
+		Callback = function(t) self.Pasted = t end,
+	})
+	tab:CreateButton({ Name = "Import Pasted Config", Callback = function()
+		local ok, data = pcall(function() return HttpService:JSONDecode(self.Pasted) end)
+		if not ok or type(data) ~= "table" or type(data.Flags) ~= "table" then
+			return self:Notify("Import failed", "Not a valid config.", "Error")
+		end
+		if fsOk then
+			local name = Sanitize(self.NameText)
+			if name == "" then name = "imported_" .. os.time() end
+			pcall(function() writefile(self.ConfigFolder .. "/" .. name .. ".json", HttpService:JSONEncode(data)) end)
+			refresh()
+		end
+		task.spawn(function()
+			local applied, count = self:ApplyData(data)
+			if applied then self:Notify("Imported", count .. " settings applied.", "Success") end
+		end)
+	end })
+end
+
+return { ThemeManager = ThemeManager, SaveManager = SaveManager }

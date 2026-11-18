@@ -403,6 +403,49 @@ end
 -- ════════════════════════════════════════════════════════════════
 --  CLASSES
 -- ════════════════════════════════════════════════════════════════
+-- Resolves a logo source (rbxassetid, number, or https image link such as a
+-- Discord CDN URL) into something an ImageLabel can display.
+-- Links need executor support for writefile + getcustomasset; otherwise nil.
+local ImageCache = {}
+
+local function ResolveImage(source)
+	if source == nil or source == "" then
+		return nil
+	end
+	if type(source) == "number" then
+		return "rbxassetid://" .. tostring(source)
+	end
+	source = tostring(source)
+	if source:find("^rbxassetid://") or source:find("^rbxasset://") or source:find("^rbxthumb://") then
+		return source
+	end
+	if source:find("^https?://") then
+		if ImageCache[source] then
+			return ImageCache[source]
+		end
+		if type(writefile) ~= "function" or type(getcustomasset) ~= "function" then
+			warn("[Rexity UI] Image links need writefile + getcustomasset (not supported by this executor).")
+			return nil
+		end
+		local ok, asset = pcall(function()
+			local data = game:HttpGet(source)
+			local hash = 0
+			for i = 1, #source do
+				hash = (hash * 31 + string.byte(source, i)) % 1000000007
+			end
+			local path = "rexity_logo_" .. tostring(hash) .. ".png"
+			writefile(path, data)
+			return getcustomasset(path)
+		end)
+		if ok and asset then
+			ImageCache[source] = asset
+			return asset
+		end
+		warn("[Rexity UI] Could not load image: " .. tostring(asset))
+	end
+	return nil
+end
+
 local Window = {}
 Window.__index = Window
 
@@ -594,6 +637,44 @@ function Window:SetMinimized(state)
 				self.Body.Visible = false
 			end
 		end)
+	end
+end
+
+-- ── Branding: logo image / logo text / title / subtitle ───────
+function Window:_RefreshLogo()
+	for _, apply in ipairs(self.LogoTargets) do
+		pcall(apply)
+	end
+end
+
+-- source: "https://cdn.discordapp.com/...png", "rbxassetid://123", a number, or nil/"" to go back to the letter
+function Window:SetLogo(source)
+	self.LogoSource = source
+	task.spawn(function()
+		local asset = ResolveImage(source)
+		if self.Destroyed then
+			return
+		end
+		self.LogoAsset = asset
+		self:_RefreshLogo()
+	end)
+end
+
+-- text shown inside the circle when no image is set (default: first letter of Name)
+function Window:SetLogoText(text)
+	self.LogoLetter = tostring(text or "")
+	self:_RefreshLogo()
+end
+
+function Window:SetTitle(text)
+	if self.TitleLabel then
+		self.TitleLabel.Text = tostring(text or "")
+	end
+end
+
+function Window:SetSubtitle(text)
+	if self.SubtitleLabel then
+		self.SubtitleLabel.Text = tostring(text or "")
 	end
 end
 
@@ -2437,16 +2518,35 @@ local function RunLoading(window, config, onDone)
 		BackgroundColor3 = Color3.new(1, 1, 1),
 		Parent = card,
 	})
-	Corner(logo, 11)
+	Corner(logo, 19)
 	local logoGradient = New("UIGradient", { Rotation = 45, Parent = logo })
 	logoGradient.Color = ColorSequence.new(Theme.Accent, Theme.AccentDark)
-	New("TextLabel", {
+	local loadText = New("TextLabel", {
 		Size = UDim2.new(1, 0, 1, 0),
-		Text = string.upper(string.sub(window.Name, 1, 1)),
+		Text = window.LogoLetter,
 		Font = Font.Bold,
 		TextSize = 20,
 		Parent = logo,
 	})
+	local loadImage = New("ImageLabel", {
+		Size = UDim2.new(1, 0, 1, 0),
+		Visible = false,
+		ZIndex = 2,
+		Parent = logo,
+	})
+	Corner(loadImage, 19)
+	local function ApplyLoadingLogo()
+		local asset = window.LogoAsset
+		loadImage.Visible = asset ~= nil
+		if asset then
+			loadImage.Image = asset
+		end
+		logo.BackgroundTransparency = asset and 1 or 0
+		loadText.Text = window.LogoLetter
+		loadText.Visible = asset == nil
+	end
+	table.insert(window.LogoTargets, ApplyLoadingLogo)
+	ApplyLoadingLogo()
 
 	New("TextLabel", {
 		Position = UDim2.fromOffset(0, 66),
@@ -2561,6 +2661,9 @@ function Library:CreateWindow(config)
 		Loading = true,
 		Destroyed = false,
 		NotifyCounter = 0,
+		LogoTargets = {},
+		LogoAsset = nil,
+		LogoLetter = config.LogoText ~= nil and tostring(config.LogoText) or string.upper(string.sub(name, 1, 1)),
 		OnClose = config.OnClose,
 	}, Window)
 	_G.RexityWindows[guiName] = window
@@ -2659,17 +2762,34 @@ function Library:CreateWindow(config)
 		BackgroundColor3 = Color3.new(1, 1, 1),
 		Parent = topBar,
 	})
-	Corner(logo, 8)
+	Corner(logo, 14)
 	local logoGradient = New("UIGradient", { Rotation = 45, Parent = logo })
-	New("TextLabel", {
+	local logoText = New("TextLabel", {
 		Size = UDim2.new(1, 0, 1, 0),
-		Text = string.upper(string.sub(name, 1, 1)),
+		Text = window.LogoLetter,
 		Font = Font.Bold,
 		TextSize = 15,
 		Parent = logo,
 	})
+	local logoImage = New("ImageLabel", {
+		Size = UDim2.new(1, 0, 1, 0),
+		Visible = false,
+		ZIndex = 2,
+		Parent = logo,
+	})
+	Corner(logoImage, 14)
+	table.insert(window.LogoTargets, function()
+		local asset = window.LogoAsset
+		logoImage.Visible = asset ~= nil
+		if asset then
+			logoImage.Image = asset
+		end
+		logo.BackgroundTransparency = asset and 1 or 0
+		logoText.Text = window.LogoLetter
+		logoText.Visible = asset == nil
+	end)
 
-	New("TextLabel", {
+	window.TitleLabel = New("TextLabel", {
 		Position = UDim2.fromOffset(52, 7),
 		Size = UDim2.new(1, -180, 0, 18),
 		Text = name,
@@ -2679,7 +2799,7 @@ function Library:CreateWindow(config)
 		TextTruncate = Enum.TextTruncate.AtEnd,
 		Parent = topBar,
 	})
-	New("TextLabel", {
+	window.SubtitleLabel = New("TextLabel", {
 		Position = UDim2.fromOffset(52, 25),
 		Size = UDim2.new(1, -180, 0, 14),
 		Text = subtitle,
@@ -2983,6 +3103,10 @@ function Library:CreateWindow(config)
 	end
 
 	-- ── Loading sequence ────────────────────────────────────────
+	if config.Logo ~= nil then
+		window:SetLogo(config.Logo)
+	end
+
 	local function Reveal()
 		window.Loading = false
 		if window.Destroyed then
